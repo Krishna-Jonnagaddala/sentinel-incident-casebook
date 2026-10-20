@@ -1,0 +1,172 @@
+// ============================================================================
+// Case 3: every query I ran, in order.
+//
+// Run them in: Azure portal > Microsoft Sentinel > your workspace > Logs (KQL mode).
+// My run was on 2026-10-20 (UTC). Where you see datetime(...), swap in your own times.
+//
+// Cast: arthur@ = IT admin (the target), rambo@ = finance, mike@ = left over from Case 1.
+// Two IPs get excluded below because they belong to other things:
+//    185.111.108.131 = the VPN address from Case 1
+//    <home-ip>       = my lab workstation. Put your own address here (or leave it out).
+// ============================================================================
+
+
+// ---- 1. Baseline: how do Arthur and Rambo normally sign in? ----------------
+// I recorded this BEFORE the attack. In Case 1 I had no baseline and it hurt.
+SigninLogs
+| where TimeGenerated > ago(3h)
+| where UserPrincipalName in~ ("arthur@openhuntx.onmicrosoft.com", "rambo@openhuntx.onmicrosoft.com")
+| project TimeGenerated, UserPrincipalName, ResultType, IPAddress,
+          Country = tostring(LocationDetails.countryOrRegion), AppDisplayName, AuthenticationRequirement
+| order by TimeGenerated asc
+// Note: normal sign-ins from home were mostly single-factor. That matters later.
+
+
+// ---- 2. Baseline admin change: a legitimate "Add user" ---------------------
+AuditLogs
+| where OperationName == "Add user"
+| project TimeGenerated, OperationName,
+          Actor = tostring(InitiatedBy.user.userPrincipalName),
+          Target = tostring(TargetResources[0].userPrincipalName)
+
+
+// ---- 3. When did Arthur get his admin roles? -------------------------------
+AuditLogs
+| where OperationName has "role"
+| project TimeGenerated, OperationName, Actor = tostring(InitiatedBy.user.userPrincipalName),
+          Target = tostring(TargetResources[0].userPrincipalName),
+          Details = tostring(TargetResources[0].modifiedProperties)
+
+
+// ---- 4. Sign-ins from anywhere except my own addresses ---------------------
+// This is the attack: six failures, then a success on Arthur, from Brazil.
+SigninLogs
+| where TimeGenerated > ago(6h)
+| where IPAddress !in ("185.111.108.131", "<home-ip>")
+| project TimeGenerated, UserPrincipalName, ResultType, ResultDescription, IPAddress,
+          Country = tostring(LocationDetails.countryOrRegion), AppDisplayName,
+          Browser = tostring(DeviceDetail.browser), OS = tostring(DeviceDetail.operatingSystem),
+          AuthenticationRequirement, RiskLevelDuringSignIn, RiskState
+| order by TimeGenerated asc
+
+
+// ---- 5. Everything Arthur's account did in the directory -------------------
+// First version, with noise. The 14 "Validate Password" rows are the new-user form checking
+// password strength as I typed. They are not guesses.
+AuditLogs
+| where TimeGenerated > ago(6h)
+| where tostring(InitiatedBy.user.userPrincipalName) =~ "arthur@openhuntx.onmicrosoft.com"
+| project TimeGenerated, OperationName, Result,
+          Target = coalesce(tostring(TargetResources[0].userPrincipalName), tostring(TargetResources[0].displayName)),
+          SourceIP = tostring(InitiatedBy.user.ipAddress), Category
+| order by TimeGenerated asc
+
+// Same thing with the noise removed. This is the one to keep.
+AuditLogs
+| where TimeGenerated > ago(6h)
+| where tostring(InitiatedBy.user.userPrincipalName) =~ "arthur@openhuntx.onmicrosoft.com"
+| where OperationName != "Validate Password"
+| project TimeGenerated, OperationName, Result,
+          Target = coalesce(tostring(TargetResources[0].userPrincipalName), tostring(TargetResources[0].displayName)),
+          SourceIP = tostring(InitiatedBy.user.ipAddress)
+| order by TimeGenerated asc
+
+
+// ---- 6. App registration and secret activity -------------------------------
+AuditLogs
+| where TimeGenerated > ago(6h)
+| where OperationName has_any ("application", "service principal", "credential", "secret", "certificates")
+| where OperationName != "Add service principal" or tostring(InitiatedBy.user.userPrincipalName) != ""
+| project TimeGenerated, OperationName, Result, Actor = tostring(InitiatedBy.user.userPrincipalName),
+          Target = tostring(TargetResources[0].displayName), SourceIP = tostring(InitiatedBy.user.ipAddress)
+| order by TimeGenerated asc
+
+
+// ---- 7. Was the backdoor user or the app ever used? ------------------------
+// No rows came back, so no use was seen.
+union SigninLogs, AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs
+| where TimeGenerated > datetime(2026-10-20 18:30)
+| where UserPrincipalName has "svc-backup01" or ServicePrincipalName has "backup-sync" or AppDisplayName has "backup-sync"
+| project TimeGenerated, Type, UserPrincipalName, ServicePrincipalName, ResultType, IPAddress
+
+
+// ---- 8. The Case 1 detection run over the last 24 hours ---------------------
+// Three rows came back: Mike (correct), Arthur from Brazil (correct), and Arthur from home (WRONG).
+// The home row is the false positive that led to version 2.
+let signins = SigninLogs
+    | where ResultType == 0 and IsInteractive == true
+    | where AuthenticationRequirement == "singleFactorAuthentication"
+    | project SignInTime = TimeGenerated, User = tolower(UserPrincipalName), SignInIP = IPAddress,
+              Country = tostring(LocationDetails.countryOrRegion), AppDisplayName;
+AuditLogs
+| where OperationName =~ "User registered security info" and Result =~ "success"
+| extend User = tolower(tostring(TargetResources[0].userPrincipalName)), RegTime = TimeGenerated
+| join kind=inner signins on User
+| where RegTime between (SignInTime .. (SignInTime + 30m))
+| summarize FirstSignIn = min(SignInTime), FirstRegistration = min(RegTime),
+            Registrations = count() by User, SignInIP, Country
+
+
+// ---- 9. Detection version 2, tested at fixed times --------------------------
+// Test 1 (Arthur): asof = 18:40 on the attack day. Expect one row, Brazil only.
+// Test 2 (Mike, Case 1): asof = 17:40. Expect one row, Nigeria.
+// To use as a real rule, replace the first line with:  let asof = now();
+let asof = datetime(2026-10-20 18:40);
+let lookback = 1h;
+let history = 7d;
+let knownCountries = SigninLogs
+    | where TimeGenerated between ((asof - history) .. (asof - lookback))
+    | where ResultType == 0
+    | summarize KnownCountries = make_set(tostring(LocationDetails.countryOrRegion)) by User = tolower(UserPrincipalName);
+let newCountrySignins = SigninLogs
+    | where TimeGenerated between ((asof - lookback) .. asof)
+    | where ResultType == 0 and IsInteractive == true
+    | project SignInTime = TimeGenerated, User = tolower(UserPrincipalName), SignInIP = IPAddress,
+              Country = tostring(LocationDetails.countryOrRegion)
+    | join kind=leftouter knownCountries on User
+    | where isnull(KnownCountries) or not(set_has_element(KnownCountries, Country));
+AuditLogs
+| where TimeGenerated between ((asof - lookback) .. asof)
+| where OperationName =~ "User registered security info" and Result =~ "success"
+| extend User = tolower(tostring(TargetResources[0].userPrincipalName)), RegTime = TimeGenerated
+| join kind=inner newCountrySignins on User
+| where RegTime between (SignInTime .. (SignInTime + 30m))
+| summarize FirstSignIn = min(SignInTime), FirstRegistration = min(RegTime), Registrations = count() by User, Country, SignInIP
+// In the saved Sentinel rule I changed "let history = 7d;" to "1d", because Sentinel only allows
+// a lookup of 2 days or more if the rule runs at most once an hour.
+
+
+// ---- 10. Containment, as it appears in the audit log -----------------------
+AuditLogs
+| where TimeGenerated > datetime(2026-10-20 18:36)
+| where OperationName has_any ("delete", "remove", "revoke", "reset password", "StsRefreshToken", "security info", "Delete application", "Delete user")
+| project TimeGenerated, OperationName, Result,
+          Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+          Target = coalesce(tostring(TargetResources[0].userPrincipalName), tostring(TargetResources[0].displayName))
+| order by TimeGenerated asc
+
+AuditLogs
+| where TimeGenerated > datetime(2026-10-20 18:36)
+| where tostring(InitiatedBy.user.userPrincipalName) =~ "krishna@openhuntx.onmicrosoft.com"
+| project TimeGenerated, OperationName, Result,
+          Target = coalesce(tostring(TargetResources[0].userPrincipalName), tostring(TargetResources[0].displayName))
+| order by TimeGenerated asc
+
+
+// ---- 11. The retest from Brazil after containment --------------------------
+// FAILED VERSION: after a union, LocationDetails is a different type in each table, so
+//   "project Country = tostring(parse_json(LocationDetails).countryOrRegion)" gave
+//   "Failed to resolve scalar expression named 'LocationDetails'".
+// FIXED VERSION: read the country inside each table first, then union the results.
+SigninLogs
+| where TimeGenerated > datetime(2026-10-20 19:11)
+| where UserPrincipalName has_any ("arthur@", "rambo@", "svc-backup01")
+| project TimeGenerated, Type, UserPrincipalName, ResultType, ResultDescription, IPAddress,
+          Country = tostring(LocationDetails.countryOrRegion), AppDisplayName
+| union (
+    AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > datetime(2026-10-20 19:11)
+    | where UserPrincipalName has_any ("arthur@", "rambo@", "svc-backup01")
+    | project TimeGenerated, Type, UserPrincipalName, ResultType, ResultDescription, IPAddress,
+              Country = tostring(parse_json(LocationDetails).countryOrRegion), AppDisplayName )
+| order by TimeGenerated asc

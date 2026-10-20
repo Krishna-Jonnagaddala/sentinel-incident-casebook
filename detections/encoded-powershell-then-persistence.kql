@@ -1,0 +1,30 @@
+// Host-level: encoded PowerShell followed within 30 minutes by persistence on the same computer.
+// Case 2: nothing alerted while hidden encoded PowerShell ran, then a scheduled task, a Run key and a new local user were created.
+//
+// Needs: Windows Security Events via AMA (All Security Events), Process Creation auditing with command line (4688), Other Object Access Events (4698).
+// Status: tested twice with fixed windows (replace the first two lines).
+//   22:23-22:30 UTC (attack): 1 row, win-endpoint01 / labadmin, first encoded 22:24:07.876, first persistence 22:25:58.417, events 4688/4698/4720, count 8.
+//   22:15-22:22 UTC (baseline, only the legitimate DailyLogCleanup task): no rows. Note: that window has no encoded PowerShell, so it shows the legitimate task does not alert on its own.
+// False-positive rate on normal traffic: not measured. Not yet saved as a scheduled rule in Sentinel.
+// First draft failed to parse because `to` is a reserved word in KQL; renamed the variables to tstart and tend.
+// Known false positives: admin tooling that uses -EncodedCommand (deployment or management agents), software that registers its own scheduled task.
+// Tuning ideas: exclude known parent processes and accounts; require the persistence to be created by the same account that ran the encoded command.
+// Blind spot: a Run key written by a PowerShell cmdlet or API call produces no 4688, so it is missed unless registry auditing or Sysmon/Defender is added.
+let tstart = ago(1h);
+let tend = now();
+let encoded = SecurityEvent
+    | where TimeGenerated between (tstart .. tend)
+    | where EventID == 4688
+    | where NewProcessName endswith "powershell.exe" or NewProcessName endswith "pwsh.exe"
+    | where CommandLine has_any (" -enc ", " -ec ", " -encodedcommand ")
+    | project EncTime = TimeGenerated, Computer, EncAccount = Account, EncParent = ParentProcessName;
+let persistence = SecurityEvent
+    | where TimeGenerated between (tstart .. tend)
+    | where EventID in (4698, 4720)
+        or (EventID == 4688 and CommandLine has_any ("schtasks", "reg ", "reg.exe") and CommandLine has_any ("/create", " add ", "CurrentVersion\\Run"))
+    | project PersistTime = TimeGenerated, Computer, PersistEvent = EventID, PersistAccount = Account, PersistCmd = CommandLine;
+encoded
+| join kind=inner persistence on Computer
+| where PersistTime between (EncTime .. (EncTime + 30m))
+| summarize FirstEncoded = min(EncTime), FirstPersistence = min(PersistTime),
+            PersistenceEvents = make_set(PersistEvent), Count = count() by Computer, EncAccount

@@ -1,0 +1,41 @@
+// ============================================================================
+// Lab checks: quick queries to see whether your set-up is working.
+// Run these in: Azure portal > Microsoft Sentinel > your workspace > Logs.
+// Do them before you start any case. If one comes back empty, fix that first.
+// ============================================================================
+
+
+// ---- Which tables have any data at all? ------------------------------------
+// This is the first thing I ran on a new workspace. Slow, but it tells you what you really have.
+search *
+| where TimeGenerated > ago(30d)
+| summarize Events = count() by $table
+| order by Events desc
+
+
+// ---- Is Entra ID sending sign-in and audit logs? ---------------------------
+// AuditLogs shows up in a few minutes. SigninLogs can take 30 minutes or more at the start.
+union SigninLogs, AuditLogs
+| summarize Events = count() by Type
+
+
+// ---- Are sign-ins reaching the workspace as fast as they happen? -----------
+// Compare this with the sign-in log in the Entra portal (Entra ID > Monitoring & health > Sign-in logs).
+// If the portal has rows and this doesn't, it is export delay. Wait.
+SigninLogs
+| project TimeGenerated, UserPrincipalName, ResultType, IPAddress, AppDisplayName
+| order by TimeGenerated desc
+| take 20
+
+
+// ---- Is the Windows VM's agent alive? --------------------------------------
+Heartbeat
+| where Computer has "win-endpoint01"
+| summarize Last = max(TimeGenerated), Beats = count() by Category
+
+
+// ---- Are Windows Security events arriving? ---------------------------------
+// Look for 4688 (process creation). If you only see logon events, the audit policy is not on yet.
+SecurityEvent
+| summarize Events = count(), Latest = max(TimeGenerated) by EventID
+| order by Events desc

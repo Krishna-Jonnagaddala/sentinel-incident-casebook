@@ -1,0 +1,19 @@
+// Single-factor interactive sign-in followed by a new authentication method on the same account.
+// Case 1: caught nothing at the time; this is the gap the case exposed.
+// Status: run against the Case 1 data. True positive: returned mike@, 185.111.108.131 (NG), first sign-in 16:55:52, first registration 16:56:05, 2 registrations.
+// Not tested for false positives: the workspace holds only a few hours of data, so there is no normal baseline.
+// Suggested schedule: run every 15 min, look back 1 h.
+// Known false positive: a new user setting up MFA for the first time looks the same.
+// Tuning idea: exclude accounts created in the last 24 h.
+let signins = SigninLogs
+    | where ResultType == 0 and IsInteractive == true
+    | where AuthenticationRequirement == "singleFactorAuthentication"
+    | project SignInTime = TimeGenerated, User = tolower(UserPrincipalName), SignInIP = IPAddress,
+              Country = tostring(LocationDetails.countryOrRegion), AppDisplayName;
+AuditLogs
+| where OperationName =~ "User registered security info" and Result =~ "success"
+| extend User = tolower(tostring(TargetResources[0].userPrincipalName)), RegTime = TimeGenerated
+| join kind=inner signins on User
+| where RegTime between (SignInTime .. (SignInTime + 30m))
+| summarize FirstSignIn = min(SignInTime), FirstRegistration = min(RegTime),
+            Registrations = count() by User, SignInIP, Country

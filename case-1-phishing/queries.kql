@@ -1,0 +1,226 @@
+// ============================================================================
+// Case 1: every query I ran, in the order I ran them.
+//
+// Where to run them: Azure portal > Microsoft Sentinel > your workspace > Logs.
+// Switch the editor to KQL mode. Set the time range at the top (Last 24 hours is fine).
+// In my run everything happened on 2026-10-20 (UTC). Where a query has a datetime(...)
+// in it, change it to the day and time of your own run.
+//
+// Users in my lab:  mike@ = the phish victim, rambo@ and arthur@ = other staff.
+// Replace openhuntx.onmicrosoft.com with your own tenant domain.
+// ============================================================================
+
+
+// ---- 1. Is any identity data arriving yet? ---------------------------------
+// I ran this right after setting up the Entra export. It showed AuditLogs first
+// and no SigninLogs for a while. Sign-in logs are slower to show up.
+union SigninLogs, AuditLogs
+| summarize Events = count() by Type
+
+
+// ---- 2. What changed in the directory, and who did it? ---------------------
+// The first three rows I got were my own setup actions and Microsoft adding
+// its own apps in the background.
+AuditLogs
+| project TimeGenerated, OperationName, Result,
+          Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+          Target = tostring(TargetResources[0].userPrincipalName)
+| order by TimeGenerated asc
+
+
+// ---- 3. "Add service principal" events: attacker or Microsoft? -------------
+// The initiator was "Microsoft Azure AD Internal - Jit Provisioning", so this
+// was Microsoft, not an attacker. Always check who initiated it.
+AuditLogs
+| where OperationName == "Add service principal"
+| project TimeGenerated, OperationName,
+          App = tostring(TargetResources[0].displayName),
+          AppId = tostring(TargetResources[0].id),
+          InitiatedBy
+
+
+// ---- 4. Every sign-in for the three accounts -------------------------------
+// This is the query that showed two countries and two devices at the same time.
+SigninLogs
+| where UserPrincipalName in~ ("mike@openhuntx.onmicrosoft.com", "rambo@openhuntx.onmicrosoft.com", "arthur@openhuntx.onmicrosoft.com")
+| project TimeGenerated, UserPrincipalName, ResultType, ResultDescription, IPAddress,
+          Country = tostring(LocationDetails.countryOrRegion), AppDisplayName,
+          Browser = tostring(DeviceDetail.browser), OS = tostring(DeviceDetail.operatingSystem)
+| order by TimeGenerated asc
+
+
+// ---- 5. Sign-ins summarised by account and IP address ----------------------
+// Shows the spray: the same IP failing against rambo and arthur.
+SigninLogs
+| where TimeGenerated > ago(24h)
+| summarize Attempts = count(), Failures = countif(ResultType != "0"),
+            Countries = make_set(tostring(LocationDetails.countryOrRegion)) by UserPrincipalName, IPAddress
+| order by Attempts desc
+
+
+// ---- 6. Did the account change? Look at security info registrations --------
+// This found the passkey being registered. The "Details" column tells you which method.
+AuditLogs
+| where OperationName in ("User registered security info", "User started security info registration")
+| project TimeGenerated, OperationName, Actor = tostring(InitiatedBy.user.userPrincipalName),
+          Details = tostring(AdditionalDetails), Modified = tostring(TargetResources[0].modifiedProperties)
+| order by TimeGenerated asc
+
+
+// ---- 7. Did Microsoft's risk scoring or Conditional Access notice? ---------
+// No. RiskState was "none" on every row, Conditional Access was "notApplied",
+// and the foreign sign-ins only needed a password (singleFactorAuthentication).
+SigninLogs
+| where TimeGenerated > ago(24h) and UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| project TimeGenerated, IPAddress, RiskLevelDuringSignIn, RiskState, RiskEventTypes_V2,
+          ConditionalAccessStatus, AuthenticationRequirement
+| order by TimeGenerated asc
+
+
+// ---- 8. Background sign-ins (tokens being used) ----------------------------
+// FAILED VERSION (kept on purpose): LocationDetails is stored as text in this table,
+// so reading .countryOrRegion straight off it gives:
+//   "Path expression countryOrRegion source must be scalar of type 'dynamic'"
+//
+//   AADNonInteractiveUserSignInLogs
+//   | where TimeGenerated > ago(24h) and UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+//   | project TimeGenerated, ResultType, IPAddress, Country = tostring(LocationDetails.countryOrRegion)
+//
+// FIXED VERSION: wrap it in parse_json() first.
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(24h) and UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| project TimeGenerated, ResultType, IPAddress,
+          Country = tostring(parse_json(LocationDetails).countryOrRegion),
+          AppDisplayName, ResourceDisplayName
+| order by TimeGenerated asc
+
+
+// ---- 9. Did early sign-in rows turn up late? --------------------------------
+// I re-ran the sign-in query over a fixed window to see if the missing early rows had arrived.
+// They had not. That gap stayed in the case as a limitation.
+SigninLogs
+| where TimeGenerated between (datetime(2026-10-20 16:20) .. datetime(2026-10-20 17:10))
+| where UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| project TimeGenerated, ResultType, IPAddress, Country = tostring(LocationDetails.countryOrRegion),
+          AppDisplayName, AuthenticationRequirement
+| order by TimeGenerated asc
+
+
+// ---- 10. What did the foreign session touch? -------------------------------
+// 73 background sign-ins across 8 apps. Most were "My Signins", the security info page.
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(24h) and UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| summarize Events = count(), First = min(TimeGenerated), Last = max(TimeGenerated) by AppDisplayName, IPAddress
+| order by Events desc
+
+
+// ---- 11. Containment: everything done to Mike's account ---------------------
+// Gives the exact time of each step: session revoke, method removal, password reset.
+AuditLogs
+| where TimeGenerated > ago(24h)
+| where tostring(TargetResources) has "mike@openhuntx.onmicrosoft.com" or tostring(InitiatedBy) has "mike@openhuntx.onmicrosoft.com" or tostring(InitiatedBy) has "krishna@openhuntx.onmicrosoft.com"
+| where OperationName !has "service principal"
+| project TimeGenerated, OperationName, Result,
+          Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+          Target = tostring(TargetResources[0].userPrincipalName), Details = tostring(AdditionalDetails)
+| order by TimeGenerated asc
+
+
+// ---- 12. Which methods were deleted? ---------------------------------------
+// Read the "Modified" column: it names Fido2 (the passkey) and SoftwareOath.
+AuditLogs
+| where TimeGenerated > ago(24h)
+| where OperationName has_any ("security info", "authentication method", "StsRefreshToken", "password")
+| project TimeGenerated, OperationName, Result,
+          Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+          Target = tostring(TargetResources[0].userPrincipalName),
+          Details = tostring(AdditionalDetails), Modified = tostring(TargetResources[0].modifiedProperties)
+| order by TimeGenerated asc
+
+
+// ---- 13. Last sign-in per address ------------------------------------------
+// Careful: this only proves anything if the attacker was still trying after you contained.
+// In my case the VPN had been switched off before containment, so it proved nothing yet.
+SigninLogs
+| where TimeGenerated > ago(24h) and UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| summarize Events = count(), Last = max(TimeGenerated) by IPAddress, Country = tostring(LocationDetails.countryOrRegion)
+
+
+// ---- 14. The retest: anything from the attacker after containment? ---------
+// FAILED VERSION when I used union and then read LocationDetails (see Case 3 for the explanation).
+// This version only reads columns that are the same in both tables.
+union SigninLogs, AADNonInteractiveUserSignInLogs
+| where TimeGenerated > datetime(2026-10-20 17:12)
+| where UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| project TimeGenerated, Type, ResultType, ResultDescription, IPAddress, AppDisplayName
+| order by TimeGenerated asc
+
+
+// ---- 15. Looking closer at the one sign-in I could not explain -------------
+// 17:24:49 succeeded after containment, with MFA. This shows the request details.
+SigninLogs
+| where TimeGenerated between (datetime(2026-10-20 17:20) .. datetime(2026-10-20 17:31))
+| where UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| project TimeGenerated, ResultType, ResultDescription, IPAddress, AppDisplayName,
+          AuthenticationRequirement, ConditionalAccessStatus, IsInteractive, UserAgent,
+          AuthMethods = tostring(AuthenticationDetails)
+| order by TimeGenerated asc
+
+
+// ---- 16. Which MFA method did that sign-in use? ----------------------------
+// FAILED VERSION: mv-expand AuthenticationDetails
+//   -> "expanded expression expected to have dynamic type" (it is text in this table).
+// FIXED VERSION:
+SigninLogs
+| where TimeGenerated between (datetime(2026-10-20 17:24:40) .. datetime(2026-10-20 17:24:55))
+| where UserPrincipalName =~ "mike@openhuntx.onmicrosoft.com"
+| mv-expand AuthDetail = parse_json(AuthenticationDetails)
+| project TimeGenerated,
+          Method = tostring(AuthDetail.authenticationMethod),
+          Step = tostring(AuthDetail.authenticationStepResultDetail),
+          Succeeded = tostring(AuthDetail.succeeded)
+// Result: "OATH verification code", succeeded. I could not explain why an OATH code worked
+// after the OATH method was deleted. It is left as an open question in the case.
+
+
+// ---- 17. Was a new method registered between containment and that sign-in? --
+AuditLogs
+| where TimeGenerated > datetime(2026-10-20 17:14)
+| where tostring(TargetResources) has "mike@openhuntx.onmicrosoft.com" or tostring(InitiatedBy) has "mike@openhuntx.onmicrosoft.com"
+| project TimeGenerated, OperationName, Result,
+          Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+          Details = tostring(AdditionalDetails), Modified = tostring(TargetResources[0].modifiedProperties)
+| order by TimeGenerated asc
+// Result: no registration event. The question stayed open.
+
+
+// ---- 18. Did the session do anything beyond signing in? --------------------
+// Both came back empty. Empty does not mean "nothing happened". Azure Activity was never connected,
+// and the Graph activity table had no data. I wrote it up as "scope not established".
+MicrosoftGraphActivityLogs
+| where TimeGenerated > datetime(2026-10-20 16:50)
+| where IPAddress == "185.111.108.131"
+| project TimeGenerated, RequestMethod, RequestUri, ResponseStatusCode, UserId
+| order by TimeGenerated asc
+
+AzureActivity
+| where TimeGenerated > datetime(2026-10-20 16:50)
+| project TimeGenerated, OperationNameValue, Caller, CallerIpAddress, ActivityStatusValue
+
+
+// ---- 19. The detection: sign-in then new authentication method (version 1) -
+// Fires on a single-factor interactive sign-in followed within 30 minutes by a security info registration.
+// It worked on this case, then raised a false positive in Case 3. The improved version is in
+// ../detections/new-country-signin-then-mfa-registration-v2.kql
+let signins = SigninLogs
+    | where ResultType == 0 and IsInteractive == true
+    | where AuthenticationRequirement == "singleFactorAuthentication"
+    | project SignInTime = TimeGenerated, User = tolower(UserPrincipalName), SignInIP = IPAddress,
+              Country = tostring(LocationDetails.countryOrRegion), AppDisplayName;
+AuditLogs
+| where OperationName =~ "User registered security info" and Result =~ "success"
+| extend User = tolower(tostring(TargetResources[0].userPrincipalName)), RegTime = TimeGenerated
+| join kind=inner signins on User
+| where RegTime between (SignInTime .. (SignInTime + 30m))
+| summarize FirstSignIn = min(SignInTime), FirstRegistration = min(RegTime),
+            Registrations = count() by User, SignInIP, Country

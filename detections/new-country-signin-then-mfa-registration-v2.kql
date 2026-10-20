@@ -1,0 +1,40 @@
+// v2: interactive sign-in from a country the user has not signed in from before,
+// followed within 30 minutes by a new authentication method on the same account.
+//
+// Why v2: v1 (case1-new-signin-then-mfa-registration.kql) matched ANY single-factor sign-in
+// in the previous 30 minutes. On the Case 3 data it returned a row for Arthur's own home
+// sign-in (GB, 18:00:20) as well as the Brazilian one, so one attack raised two incidents.
+//
+// Country, not IP: Arthur's home also appears as an IPv6 address, which is a "new IP" but not a new country.
+// Single-factor is no longer required: the attacker can satisfy MFA (Case 3 sign-in at 18:29:12).
+//
+// Status: tested twice against lab data by replacing `now()` with a fixed time.
+//   asof 2026-10-20 18:40 -> one row: arthur, BR (v1 also returned his home GB sign-in; v2 does not).
+//   asof 2026-10-20 17:40 -> one row: mike, NG (caveat: Mike has no earlier history in the workspace, so every country is new for him).
+// As a scheduled rule: Sentinel requires a run frequency of at least 1 hour when the lookup period is 2 days or more.
+//   To keep 15-minute detection the saved rule uses `let history = 1d;` and a 1-day lookup. The tests above used 7d, but the
+//   workspace holds only a few hours of data, so 1d returns the same baseline. A longer baseline needs a watchlist or summary rule.
+// False-positive rate on normal traffic: not measured (a few hours of data only).
+// Known false positives: a user's first sign-ins from a new country while travelling and adding a method;
+// a brand-new account (no history, so every country is new).
+let asof = now();
+let lookback = 1h;
+let history = 7d;
+let knownCountries = SigninLogs
+    | where TimeGenerated between ((asof - history) .. (asof - lookback))
+    | where ResultType == 0
+    | summarize KnownCountries = make_set(tostring(LocationDetails.countryOrRegion)) by User = tolower(UserPrincipalName);
+let newCountrySignins = SigninLogs
+    | where TimeGenerated between ((asof - lookback) .. asof)
+    | where ResultType == 0 and IsInteractive == true
+    | project SignInTime = TimeGenerated, User = tolower(UserPrincipalName), SignInIP = IPAddress,
+              Country = tostring(LocationDetails.countryOrRegion)
+    | join kind=leftouter knownCountries on User
+    | where isnull(KnownCountries) or not(set_has_element(KnownCountries, Country));
+AuditLogs
+| where TimeGenerated between ((asof - lookback) .. asof)
+| where OperationName =~ "User registered security info" and Result =~ "success"
+| extend User = tolower(tostring(TargetResources[0].userPrincipalName)), RegTime = TimeGenerated
+| join kind=inner newCountrySignins on User
+| where RegTime between (SignInTime .. (SignInTime + 30m))
+| summarize FirstSignIn = min(SignInTime), FirstRegistration = min(RegTime), Registrations = count() by User, Country, SignInIP
