@@ -1,5 +1,7 @@
 # Microsoft Incident Investigation Casebook
 
+**By Krishna Jonnagaddala — SOC Analyst, SC-200, CompTIA Security+, Blue Team Level 1.**
+
 Three incident investigations, worked end to end in a Microsoft Sentinel and Entra ID lab, written for people who are new to the SOC.
 
 Most training material stops at "here's the alert". This repo shows what comes after: the questions you ask, the queries you write, how you decide what's true, how far it went, how you stop it and check it stopped, and how you explain it to different people. Every step is here: the clicks, the KQL, the PowerShell, the screenshots, and the mistakes.
@@ -88,7 +90,14 @@ The one meaningful cost was the Windows VM, at USD 0.207 an hour while running, 
 
 ## Screenshots and privacy
 
-Screenshots come from my own tenant and VM. I blacked out my home IP addresses, locations, subscription IDs, my surname, my account name in the portal's top bar, and a throwaway lab password. VPN addresses, the tenant name and the fictional users are left visible because they're part of the evidence.
+Screenshots come from my own tenant and VM. I blacked out my home IP addresses, locations, subscription IDs, my personal account name in the portal's top bar, and a throwaway lab password. VPN addresses, the tenant name and the fictional users are left visible because they're part of the evidence.
+
+## Licence
+
+- **Code** (`scripts/`, `queries/`, `detections/`, and the `queries.kql` file in each case): [MIT](LICENSE).
+- **Writing and screenshots** (everything else): [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Reuse them, just credit me.
+
+The full wording is in [`LICENSE`](LICENSE).
 
 ## A warning
 

@@ -1,0 +1,51 @@
+Copyright (c) 2026 Krishna Jonnagaddala
+
+This repository has two licences. Which one applies depends on what the file is.
+
+------------------------------------------------------------------------
+1. CODE: MIT License
+------------------------------------------------------------------------
+
+Applies to:
+  scripts/
+  queries/
+  detections/
+  case-1-phishing/queries.kql
+  case-2-endpoint-persistence/queries.kql
+  case-3-account-compromise/queries.kql
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The scripts create an administrator account and run hidden PowerShell. Use
+them only on machines you own and can delete.
+
+------------------------------------------------------------------------
+2. WRITING AND SCREENSHOTS: Creative Commons Attribution 4.0 International
+------------------------------------------------------------------------
+
+Applies to everything not listed under the MIT licence above, including all
+Markdown files and all images.
+
+You are free to share (copy and redistribute the material in any medium or
+format) and adapt (remix, transform and build upon it) for any purpose, even
+commercially, as long as you give appropriate credit to Krishna Jonnagaddala,
+provide a link to the licence, and indicate if you made changes.
+
+Full legal text: https://creativecommons.org/licenses/by/4.0/legalcode
+Summary:         https://creativecommons.org/licenses/by/4.0/
